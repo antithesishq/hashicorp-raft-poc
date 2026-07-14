@@ -1,0 +1,93 @@
+# syntax=docker/dockerfile:1.4
+# Builds the client container — the client of the raft cluster
+# that Antithesis dispatches test commands into.
+#
+# Build context: antithesis/raft-client/ (a self-contained Go module rooted
+# there). The harness only talks to the SUT over TCP and shares no Go code
+# with it, so it lives in its own module — independent of the vendored
+# hashicorp/raft go.mod and untouched by `git subtree pull`.
+#
+# Contents:
+#   /usr/local/bin/setup    — ENTRYPOINT. Waits for a leader, emits
+#                             SetupComplete via the Antithesis lifecycle
+#                             SDK, then idles to keep the container alive.
+#                             Built from raft-client/setup/.
+#
+#   /opt/antithesis/test/v1/raft/<name>
+#                           — Antithesis test commands. Built from every
+#                             directory under raft-client/test-commands/.
+#                             Source dir name (with hyphens) becomes the
+#                             test-command filename (with underscores).
+#
+# Adding a new test command: `mkdir raft-client/test-commands/<antithesis-prefix>-<name>/`,
+# write a `main.go`, rebuild. The wildcard `go build`, single COPY, and
+# install loop below pick it up automatically — no edits to this file.
+#
+# Instrumentor mode: `-assert_only`. The client only runs test commands and
+# the setup entrypoint — none of which are the SUT — so we want assertion
+# catalog generation without coverage instrumentation or symbols. The flag
+# writes `antithesis_catalog.go` in place into the project dir; we build
+# directly from /src.
+#
+# Same caching strategy as Dockerfile.raft-node: deps download before source,
+# build cache mounted across runs.
+
+ARG ANTITHESIS_SDK_VERSION=v0.7.0
+
+FROM docker.io/library/golang:1.24-bookworm AS builder
+
+ARG ANTITHESIS_SDK_VERSION
+ENV CGO_ENABLED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc libc6-dev git ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    go install github.com/antithesishq/antithesis-sdk-go/tools/antithesis-go-instrumentor@${ANTITHESIS_SDK_VERSION}
+
+WORKDIR /src
+
+# Pre-pull dependencies. Invalidated only by go.mod/go.sum changes.
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+
+# Full source.
+COPY . .
+
+# Generate the assertion catalog in place — no coverage instrumentation,
+# no symbols, no output dir.
+RUN antithesis-go-instrumentor -assert_only /src
+
+# Build the entrypoint and every test command in one shot. `go build -o /out/`
+# (trailing slash) writes one binary per package under the wildcard path,
+# named after the source directory.
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    go build -o /out/ ./setup ./test-commands/...
+
+FROM docker.io/library/debian:bookworm-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates bash && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /opt/antithesis/test/v1/raft
+COPY --from=builder /out/ /usr/local/bin/
+
+# Install every test-command binary into the Antithesis test composer dir.
+# Source-dir name (hyphens) becomes test-command filename (underscores).
+# `setup` is the container entrypoint and gets skipped — it lives only on
+# PATH, never in the test composer dir.
+RUN for bin in /usr/local/bin/*; do \
+        name=$(basename "$bin"); \
+        [ "$name" = "setup" ] && continue; \
+        target="/opt/antithesis/test/v1/raft/$(echo "$name" | tr '-' '_')"; \
+        cp "$bin" "$target" && chmod +x "$target"; \
+    done
+
+ENV NO_COLOR=1
+
+ENTRYPOINT ["/usr/local/bin/setup"]

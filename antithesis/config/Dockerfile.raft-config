@@ -1,0 +1,13 @@
+# syntax=docker/dockerfile:1.4
+# Minimal config image: carries the docker-compose.yaml that Antithesis uses
+# to bring up the SUT. Hand-rolled equivalent of what snouty would produce as
+# `snouty-config`.
+#
+# Image gets tagged as raft-config:${BUILD_TAG} and pushed alongside raft-node
+# / raft-client / raft-monitor. The accompanying .env file pins the
+# ${BUILD_TAG} interpolation in docker-compose.yaml to the tag chosen at
+# build time, so the sibling images get pulled at the matching tag.
+
+FROM scratch
+COPY docker-compose.yaml /docker-compose.yaml
+COPY .env /.env

@@ -103,6 +103,10 @@ func (r *Raft) runFSM() {
 
 		switch req.log.Type {
 		case LogCommand:
+			r.logger.Debug("applying entry to FSM",
+				"index", req.log.Index,
+				"term", req.log.Term,
+				"data", fmt.Sprintf("%x", req.log.Data))
 			start := time.Now()
 			resp = r.fsm.Apply(req.log)
 			metrics.MeasureSince([]string{"raft", "fsm", "apply"}, start)
@@ -154,6 +158,14 @@ func (r *Raft) runFSM() {
 
 		var responses []interface{}
 		if len(sendLogs) > 0 {
+			for _, l := range sendLogs {
+				if l.Type == LogCommand {
+					r.logger.Debug("applying entry to FSM",
+						"index", l.Index,
+						"term", l.Term,
+						"data", fmt.Sprintf("%x", l.Data))
+				}
+			}
 			start := time.Now()
 			responses = batchingFSM.ApplyBatch(sendLogs)
 			metrics.MeasureSince([]string{"raft", "fsm", "applyBatch"}, start)

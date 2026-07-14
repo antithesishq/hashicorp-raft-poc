@@ -1,0 +1,74 @@
+# syntax=docker/dockerfile:1.4
+# Builds the raft-node SUT binary with Antithesis instrumentation.
+#
+# Layer order is tuned for caching:
+#   1. Base + apt packages — cached unless Dockerfile changes.
+#   2. Instrumentor install — cached unless ANTITHESIS_SDK_VERSION changes.
+#   3. go.mod + go.sum + `go mod download` — cached unless deps change.
+#   4. Full source COPY — invalidated on ANY source change.
+#   5. Instrument + build — re-runs whenever source changes, but the Go
+#      build cache mount makes incremental compilation fast.
+#
+# Stages:
+#  1. builder — runs antithesis-go-instrumentor over the source tree, then
+#     compiles the raft-node binary from the instrumented `customer/` tree.
+#  2. runtime — minimal image with the built binary and the emitted symbols.
+
+ARG ANTITHESIS_SDK_VERSION=v0.7.0
+
+FROM docker.io/library/golang:1.24-bookworm AS builder
+
+ARG ANTITHESIS_SDK_VERSION
+ENV CGO_ENABLED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc libc6-dev git ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install the Antithesis Go instrumentor (pinned to the SDK version).
+# Cache mounts preserve the module + build cache across builds; the resulting
+# `antithesis-go-instrumentor` binary lives in /go/bin which is part of the
+# layer, so the install itself caches at the layer level too.
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    go install github.com/antithesishq/antithesis-sdk-go/tools/antithesis-go-instrumentor@${ANTITHESIS_SDK_VERSION}
+
+WORKDIR /src
+
+# Pre-pull dependencies. This layer only invalidates when go.mod or go.sum
+# change — most edits to .go files leave it cached.
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+
+# Full source (the patched library + antithesis/ harness). This layer
+# invalidates on any source change, which is unavoidable for the instrumentor.
+COPY . .
+
+# Instrument the source tree.
+# Output layout: /instrumented/customer (build from here), /instrumented/symbols
+# (copy .sym.tsv to /symbols/), /instrumented/notifier (runtime helper).
+RUN mkdir -p /instrumented && antithesis-go-instrumentor /src /instrumented
+
+# Build the raft-node binary from the instrumented tree.
+# Cache mounts preserve the Go build cache so only changed packages recompile.
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    cd /instrumented/customer && \
+    go build -o /out/raft-node ./antithesis/raft-node
+
+FROM docker.io/library/debian:bookworm-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# Antithesis requires symbols under /symbols/ for Go.
+RUN mkdir -p /symbols /opt/antithesis/catalog
+COPY --from=builder /instrumented/symbols/ /symbols/
+
+COPY --from=builder /out/raft-node /usr/local/bin/raft-node
+
+ENV NO_COLOR=1
+
+ENTRYPOINT ["/usr/local/bin/raft-node"]

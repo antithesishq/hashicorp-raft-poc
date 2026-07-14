@@ -607,8 +607,17 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 		return nil, err
 	}
 
-	// Scan through the log for any configuration change entries.
 	snapshotIndex, _ := r.getLastSnapshot()
+
+	// Antithesis instrumentation: emit the persisted log's terminus so the
+	// raft-monitor treats this node's recovered prefix as present.
+	if lastLog.Index > 0 {
+		r.logger.Info("recovered log from disk",
+			"last-index", lastLog.Index,
+			"last-term", lastLog.Term)
+	}
+
+	// Scan through the log for any configuration change entries.
 	lastappliedIndex := r.getLastApplied()
 	for index := max(snapshotIndex, lastappliedIndex) + 1; index <= lastLog.Index; index++ {
 		var entry Log

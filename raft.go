@@ -6,8 +6,10 @@ package raft
 import (
 	"bytes"
 	"container/list"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"strings"
 	"sync/atomic"
@@ -17,6 +19,36 @@ import (
 
 	"github.com/hashicorp/go-metrics/compat"
 )
+
+// antithesisEntryDigest is the per-entry payload attached to every
+// "appended entries to log store" emission. The compact key names keep the
+// JSON line size bounded under AE bursts (with the default
+// MaxAppendEntries=64 the array is well under 1 KB per emission). The raft
+// monitor decodes the JSON list, joins it with "last-index" / "new-entries"
+// to recover each entry's index, and uses (t, c) to enforce log matching,
+// state-machine safety (recovered at apply time), and leader completeness
+// (committed-prefix check on election).
+//
+// CRC32 (IEEE polynomial) is used rather than a cryptographic hash because
+// this is a test oracle: a chance collision masking a real divergence would
+// show up on the next non-colliding entry, and the SUT pays no security
+// penalty for using a non-cryptographic checksum.
+type antithesisEntryDigest struct {
+	T uint64 `json:"t"`
+	C uint32 `json:"c"`
+}
+
+func antithesisEntryDigests(logs []*Log) string {
+	digests := make([]antithesisEntryDigest, len(logs))
+	for i, l := range logs {
+		digests[i] = antithesisEntryDigest{T: l.Term, C: crc32.ChecksumIEEE(l.Data)}
+	}
+	b, err := json.Marshal(digests)
+	if err != nil {
+		return "[]"
+	}
+	return string(b)
+}
 
 const (
 	minCheckInterval          = 10 * time.Millisecond
@@ -279,6 +311,26 @@ func (r *Raft) liveBootstrap(configuration Configuration) error {
 	}
 	r.setCurrentTerm(1)
 	r.setLastLog(entry.Index, entry.Term)
+	// Emit the same "appended entries to log store" record that dispatchLogs()
+	// produces, so raft-monitor consumers that reconstruct per-source log
+	// content can record the bootstrap entry's (term, crc).
+	// BootstrapCluster writes directly to the log store and bypasses
+	// dispatchLogs, leaving the bootstrap node's index-1 entry off the wire —
+	// followers see it via the normal appendEntries path, but a later election
+	// restoring leadership to the bootstrap node would otherwise look like a
+	// missing committed entry.
+	//
+	// role is "follower": every node boots as a Follower and processes the
+	// bootstrap request from the follower loop — it is not a leader yet, and
+	// leadership only follows from winning an election. Consumers that key on
+	// leader-role appends (e.g. an append/commit-divergence window) must
+	// not treat this seed write as leader activity.
+	r.logger.Debug("appended entries to log store",
+		"role", "follower",
+		"last-index", entry.Index,
+		"last-term", entry.Term,
+		"new-entries", 1,
+		"entries", antithesisEntryDigests([]*Log{&entry}))
 	return r.processConfigurationLogEntry(&entry)
 }
 
@@ -431,7 +483,7 @@ func (r *Raft) runCandidate() {
 			r.mainThreadSaturation.working()
 			// Election failed! Restart the election. We simply return,
 			// which will kick us back into runCandidate
-			r.logger.Warn("Election timeout reached, restarting election")
+			r.logger.Warn("Election timeout reached, restarting election", "term", term)
 			return
 
 		case <-r.shutdownCh:
@@ -788,6 +840,15 @@ func (r *Raft) leaderLoop() {
 			// Process the newly committed entries
 			oldCommitIndex := r.getCommitIndex()
 			commitIndex := r.leaderState.commitment.getCommitIndex()
+
+			if commitIndex > oldCommitIndex {
+				r.logger.Debug("advanced commitIndex",
+					"role", "leader",
+					"term", r.getCurrentTerm(),
+					"from", oldCommitIndex,
+					"to", commitIndex)
+			}
+
 			r.setCommitIndex(commitIndex)
 
 			// New configuration has been committed, set it as the committed
@@ -1275,6 +1336,12 @@ func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
 		r.setState(Follower)
 		return
 	}
+	r.logger.Debug("appended entries to log store",
+		"role", "leader",
+		"last-index", lastIndex,
+		"last-term", term,
+		"new-entries", n,
+		"entries", antithesisEntryDigests(logs))
 	r.leaderState.commitment.match(r.localID, lastIndex)
 
 	// Update the last log since it's on disk now
@@ -1565,6 +1632,13 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 				// state if there was a truncation above
 				return
 			}
+			lastNew := newEntries[len(newEntries)-1]
+			r.logger.Debug("appended entries to log store",
+				"role", "follower",
+				"last-index", lastNew.Index,
+				"last-term", lastNew.Term,
+				"new-entries", len(newEntries),
+				"entries", antithesisEntryDigests(newEntries))
 
 			// Handle any new configuration changes
 			for _, newEntry := range newEntries {
@@ -1588,8 +1662,15 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 	// Update the commit index
 	if a.LeaderCommitIndex > 0 && a.LeaderCommitIndex > r.getCommitIndex() {
 		start := time.Now()
+		oldCommitIndex := r.getCommitIndex()
 		idx := min(a.LeaderCommitIndex, r.getLastIndex())
 		r.setCommitIndex(idx)
+		if idx > oldCommitIndex {
+			r.logger.Debug("advanced commitIndex",
+				"role", "follower",
+				"from", oldCommitIndex,
+				"to", idx)
+		}
 		if r.configurations.latestIndex <= idx {
 			r.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)
 		}
@@ -1970,7 +2051,16 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 		r.logger.Error("failed to compact logs", "error", err)
 	}
 
-	r.logger.Info("Installed remote snapshot")
+	// Antithesis: emit the snapshot watermark so the raft-monitor can mark
+	// indices <= last-index as covered by the snapshot for this node. The
+	// install path replaces the log's prefix with restored FSM state without
+	// going through "appended entries to log store", so consumers that
+	// reconstruct per-node log content from the append stream would otherwise
+	// see a gap at every snapshotted index.
+	r.logger.Info("Installed remote snapshot",
+		"last-index", req.LastLogIndex,
+		"last-term", req.LastLogTerm)
+
 	resp.Success = true
 	r.setLastContact()
 }
@@ -2044,7 +2134,6 @@ func (r *Raft) electSelf() <-chan *voteResult {
 				if err := r.persistVote(req.Term, req.Addr); err != nil {
 					r.logger.Error("failed to persist vote", "error", err)
 					return nil
-
 				}
 				// Include our own vote
 				respCh <- &voteResult{
@@ -2157,6 +2246,7 @@ func (r *Raft) persistVote(term uint64, candidate []byte) error {
 	if err := r.stable.Set(keyLastVoteCand, candidate); err != nil {
 		return err
 	}
+	r.logger.Debug("granted vote", "term", term, "candidate", string(candidate))
 	return nil
 }
 
@@ -2167,6 +2257,7 @@ func (r *Raft) setCurrentTerm(t uint64) {
 		panic(fmt.Errorf("failed to save current term: %v", err))
 	}
 	r.raftState.setCurrentTerm(t)
+	r.logger.Debug("updated currentTerm", "term", t)
 }
 
 // setState is used to update the current state. Any state

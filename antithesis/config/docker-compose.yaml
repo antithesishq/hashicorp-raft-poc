@@ -1,0 +1,102 @@
+# Antithesis test harness for hashicorp/raft.
+#
+# 3-node cluster (odd-sized, single failure tolerated) + 1 client + 1 monitor.
+# The monitor receives JSON log records from each raft-node's hclog
+# InterceptLogger sink and checks global properties that need cross-node
+# visibility (e.g., state-machine safety, election safety).
+# The workload skill will introduce additional transient containers when it
+# needs them (e.g., a 4th node for AddVoter / AddNonvoter property exercises).
+#
+# All images build from the patched fork in this repo (B-3 decision) and are
+# tagged with the full ant-presearch registry path so Antithesis pulls them
+# from the dev tenant registry rather than looking at localhost.
+#
+# Image tag is parameterized via ${BUILD_TAG} so build-and-push.sh can push
+# experiment tags (e.g. branch-shaped) without forking this file. Default is
+# `:latest`. The accompanying .env file (baked into the hashicorp-raft-config image)
+# carries the value chosen at build time so the compose loader picks it up.
+name: raft
+
+services:
+  raft-monitor:
+    container_name: raft-monitor
+    hostname: raft-monitor
+    platform: linux/amd64
+    build:
+      context: ../..
+      dockerfile: antithesis/config/Dockerfile.raft-monitor
+    image: us-central1-docker.pkg.dev/molten-verve-216720/ant-presearch-repository/hashicorp-raft-monitor:${BUILD_TAG:-latest}
+    environment:
+      NO_COLOR: "1"
+
+  raft-node-0:
+    container_name: raft-node-0
+    hostname: raft-node-0
+    platform: linux/amd64
+    build:
+      context: ../..
+      dockerfile: antithesis/config/Dockerfile.raft-node
+    image: us-central1-docker.pkg.dev/molten-verve-216720/ant-presearch-repository/hashicorp-raft-node:${BUILD_TAG:-latest}
+    environment:
+      NO_COLOR: "1"
+    command:
+      - "-id=node-0"
+      - "-raft-addr=raft-node-0:8300"
+      - "-client-addr=0.0.0.0:8400"
+      - "-bootstrap=true"
+      - "-peers=node-0=raft-node-0:8300,node-1=raft-node-1:8300,node-2=raft-node-2:8300"
+      - "-monitor-addr=raft-monitor:9000"
+    depends_on:
+      - raft-monitor
+
+  raft-node-1:
+    container_name: raft-node-1
+    hostname: raft-node-1
+    platform: linux/amd64
+    image: us-central1-docker.pkg.dev/molten-verve-216720/ant-presearch-repository/hashicorp-raft-node:${BUILD_TAG:-latest}
+    environment:
+      NO_COLOR: "1"
+    command:
+      - "-id=node-1"
+      - "-raft-addr=raft-node-1:8300"
+      - "-client-addr=0.0.0.0:8400"
+      - "-bootstrap=true"
+      - "-peers=node-0=raft-node-0:8300,node-1=raft-node-1:8300,node-2=raft-node-2:8300"
+      - "-monitor-addr=raft-monitor:9000"
+    depends_on:
+      - raft-monitor
+
+  raft-node-2:
+    container_name: raft-node-2
+    hostname: raft-node-2
+    platform: linux/amd64
+    image: us-central1-docker.pkg.dev/molten-verve-216720/ant-presearch-repository/hashicorp-raft-node:${BUILD_TAG:-latest}
+    environment:
+      NO_COLOR: "1"
+    command:
+      - "-id=node-2"
+      - "-raft-addr=raft-node-2:8300"
+      - "-client-addr=0.0.0.0:8400"
+      - "-bootstrap=true"
+      - "-peers=node-0=raft-node-0:8300,node-1=raft-node-1:8300,node-2=raft-node-2:8300"
+      - "-monitor-addr=raft-monitor:9000"
+    depends_on:
+      - raft-monitor
+
+  raft-client:
+    container_name: raft-client
+    hostname: raft-client
+    platform: linux/amd64
+    build:
+      context: ../..
+      dockerfile: antithesis/config/Dockerfile.raft-client
+    image: us-central1-docker.pkg.dev/molten-verve-216720/ant-presearch-repository/hashicorp-raft-client:${BUILD_TAG:-latest}
+    environment:
+      NO_COLOR: "1"
+    command:
+      - "-nodes=raft-node-0:8400,raft-node-1:8400,raft-node-2:8400"
+      - "-wait-for-leader=60s"
+    depends_on:
+      - raft-node-0
+      - raft-node-1
+      - raft-node-2

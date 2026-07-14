@@ -1,0 +1,28 @@
+# syntax=docker/dockerfile:1.4
+# Builds the raft-monitor container — a Python sidecar that receives JSON
+# log records (one per line) from each raft-node's hclog InterceptLogger
+# sink and dispatches them to global-property consumers. Build context is
+# antithesis/raft-monitor/ itself.
+
+FROM docker.io/library/python:3.12-slim
+
+WORKDIR /opt/monitor
+
+# antithesis ships assertions through libvoidstar.so when present (in the
+# Antithesis test env) and falls back to a local-file handler otherwise.
+RUN pip install --no-cache-dir antithesis
+
+COPY . /opt/monitor/
+
+# Antithesis scans /opt/antithesis/catalog (following symlinks) to discover
+# every assertion callsite — including reachable()/sometimes() that never
+# execute. Without this symlink, uncovered callsites are invisible to triage
+# and can't be flagged as failures.
+RUN mkdir -p /opt/antithesis && ln -s /opt/monitor /opt/antithesis/catalog
+
+ENV PYTHONUNBUFFERED=1
+ENV NO_COLOR=1
+
+EXPOSE 9000
+
+ENTRYPOINT ["python", "/opt/monitor/server.py"]
