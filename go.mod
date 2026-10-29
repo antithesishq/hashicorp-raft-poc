@@ -5,7 +5,7 @@ go 1.24.0
 retract v1.1.3 // Deleted original tag; module checksum may not be accurate.
 
 require (
-	github.com/antithesishq/antithesis-sdk-go v0.7.0
+	github.com/antithesishq/antithesis-sdk-go v0.8.0
 	github.com/hashicorp/go-hclog v1.6.3
 	github.com/hashicorp/go-metrics v0.5.4
 	github.com/hashicorp/go-msgpack/v2 v2.1.5

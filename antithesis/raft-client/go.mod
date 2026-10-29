@@ -3,7 +3,7 @@ module raft-client
 go 1.24.0
 
 require (
-	github.com/antithesishq/antithesis-sdk-go v0.7.0
+	github.com/antithesishq/antithesis-sdk-go v0.8.0
 	github.com/hashicorp/go-hclog v1.6.3
 )
 
