@@ -126,13 +126,13 @@ func main() {
 		os.Exit(2)
 	}
 
-	// Primary logger writes human-readable text at INFO to stderr. The
+	// Primary logger writes human-readable text at DEBUG to stderr. The
 	// InterceptLogger lets us attach extra sinks at runtime — see below for
 	// the JSON-over-TCP sink that ships every record (down to DEBUG) to the
 	// raft-monitor sidecar for global-property checking.
 	ilogger := hclog.NewInterceptLogger(&hclog.LoggerOptions{
 		Name:   *nodeID,
-		Level:  hclog.Info,
+		Level:  hclog.Debug,
 		Output: os.Stderr,
 	})
 	var logger hclog.Logger = ilogger
